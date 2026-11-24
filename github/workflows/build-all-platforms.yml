@@ -1,0 +1,319 @@
+
+name: Build MotionItOn All Platforms
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '*.zip'
+      - '.github/workflows/build.yml'
+      - '.github/workflows/build-all-platforms.yml'
+      - '.github/workflows/android-apk.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: motioniton-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate workflow and locate project archive
+    runs-on: ubuntu-latest
+
+    outputs:
+      build_requested: ${{ steps.detect.outputs.build_requested }}
+      zip_path: ${{ steps.detect.outputs.zip_path }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate workflow registration
+        run: |
+          echo "MotionItOn Actions is operational."
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Branch: $GITHUB_REF_NAME"
+
+      - name: Detect build request and ZIP
+        id: detect
+        shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          BUILD=false
+
+          if [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
+            CHANGED_FILES="$(git ls-tree -r --name-only HEAD)"
+          else
+            CHANGED_FILES="$(git diff --name-only "$BEFORE_SHA" "$GITHUB_SHA")"
+          fi
+
+          if grep -Eiq '(^|/)[^/]*MotionItOn[^/]*\.zip$' <<< "$CHANGED_FILES"; then
+            BUILD=true
+          fi
+
+          ZIP_FILE="$(find . -maxdepth 1 -type f -iname 'MotionItOn*.zip' -print -quit)"
+
+          if [[ "$BUILD" == true && -z "$ZIP_FILE" ]]; then
+            echo "ERROR: No MotionItOn ZIP found."
+            exit 1
+          fi
+
+          echo "build_requested=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "zip_path=${ZIP_FILE#./}" >> "$GITHUB_OUTPUT"
+
+      - name: Workflow-only validation complete
+        if: steps.detect.outputs.build_requested == 'false'
+        run: echo "Workflow validated. No application build requested."
+
+  prepare:
+    name: Extract and build web application
+    needs: validate
+    if: needs.validate.outputs.build_requested == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Extract project ZIP
+        env:
+          ZIP_FILE: ${{ needs.validate.outputs.zip_path }}
+        run: |
+          set -euo pipefail
+          mkdir project
+          unzip -q "$ZIP_FILE" -d project
+
+          test -f project/package.json
+          test -f project/next.config.ts
+          test -f project/capacitor.config.ts
+          test -f project/electron/main.cjs
+
+      - name: Install dependencies
+        working-directory: project
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            echo "Lockfile missing; using npm install temporarily."
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Verify build scripts
+        working-directory: project
+        run: |
+          node -e "const p=require('./package.json'); for (const s of ['build','desktop:win']) if(!p.scripts?.[s]) throw new Error('Missing npm script: '+s)"
+
+      - name: Build web application
+        working-directory: project
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ vars.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ vars.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+        run: npm run build
+
+      - name: Verify web export
+        run: test -s project/out/index.html
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MotionItOn-Web
+          path: project/out/
+          if-no-files-found: error
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MotionItOn-Prepared-Project
+          path: |
+            project/
+            !project/node_modules/**
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  android:
+    name: Build Android APK
+    needs: [validate, prepare]
+    if: needs.validate.outputs.build_requested == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK
+        run: |
+          sdkmanager --install \
+            'platform-tools' \
+            'platforms;android-35' \
+            'build-tools;35.0.0'
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: MotionItOn-Prepared-Project
+          path: project
+
+      - name: Install dependencies
+        working-directory: project
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Generate Android project
+        working-directory: project
+        run: |
+          set -euo pipefail
+          if [ ! -d android ]; then
+            npx cap add android
+          fi
+          npx cap sync android
+          test -f android/gradlew
+
+      - name: Build Android APK
+        working-directory: project/android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MotionItOn-Android-APK
+          path: project/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Build Windows installer
+    needs: [validate, prepare]
+    if: needs.validate.outputs.build_requested == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 55
+
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: MotionItOn-Prepared-Project
+          path: project
+
+      - name: Install dependencies
+        working-directory: project
+        shell: pwsh
+        run: |
+          if (Test-Path package-lock.json) {
+            npm ci --no-audit --no-fund
+          } else {
+            npm install --no-audit --no-fund
+          }
+
+      - name: Build Windows installer
+        working-directory: project
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ vars.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ vars.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+        run: npm run desktop:win
+
+      - name: Verify Windows installer
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem 'project/release' -Filter '*.exe' |
+            Select-Object -First 1
+
+          if ($null -eq $installer) {
+            throw "Windows installer was not generated."
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MotionItOn-Windows-Installer
+          path: project/release/*.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-containers:
+    name: Build and publish MotionItOn container images
+    needs: validate
+    if: needs.validate.outputs.build_requested == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract project archive
+        env:
+          ZIP_FILE: ${{ needs.validate.outputs.zip_path }}
+        run: |
+          set -euo pipefail
+          mkdir project
+          unzip -q "$ZIP_FILE" -d project
+
+          test -f project/Dockerfile.gpu-worker
+          test -f project/Dockerfile.backend
+          test -f project/engine/remote_worker.py
+          test -f project/backend/server.mjs
+          test -f project/compose.backend.yml
+
+      - name: Set lowercase image owner
+        id: image
+        shell: bash
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish Wan 2.2 GPU worker
+        uses: docker/build-push-action@v6
+        with:
+          context: project
+          file: project/Dockerfile.gpu-worker
+          push: true
+          tags: |
+            ghcr.io/${{ steps.image.outputs.owner }}/motioniton-gpu-worker:wan22
+            ghcr.io/${{ steps.image.outputs.owner }}/motioniton-gpu-worker:sha-${{ github.sha }}
+          cache-from: type=gha,scope=motioniton-gpu-worker
+          cache-to: type=gha,mode=max,scope=motioniton-gpu-worker
+
+      - name: Build and publish MotionItOn backend
+        uses: docker/build-push-action@v6
+        with:
+          context: project
+          file: project/Dockerfile.backend
+          push: true
+          tags: |
+            ghcr.io/${{ steps.image.outputs.owner }}/motioniton-backend:latest
+            ghcr.io/${{ steps.image.outputs.owner }}/motioniton-backend:sha-${{ github.sha }}
+          cache-from: type=gha,scope=motioniton-backend
+          cache-to: type=gha,mode=max,scope=motioniton-backend
